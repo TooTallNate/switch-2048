@@ -12,12 +12,12 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@nx.js/constants": "0.2.0"
+    "@nx.js/constants": "0.4.0"
   },
   "devDependencies": {
-    "@nx.js/nro": "^0.0.54",
-    "@nx.js/nsp": "^0.0.54",
-    "@nx.js/runtime": "^0.0.54",
+    "@nx.js/nro": "^0.0.67",
+    "@nx.js/nsp": "^0.0.67",
+    "@nx.js/runtime": "^0.0.67",
     "esbuild": "^0.17.19"
   },
   "author": {

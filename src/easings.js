@@ -1,3 +1,6 @@
+// Cubic bezier with hoisted control points - returns scalar y value only.
+// Eliminates per-call object allocations (5 objects per call previously).
+
 const bezier = (t, p0, p1, p2, p3) => {
 	const c = (1 - t) * (1 - t) * (1 - t);
 	const b = 3 * ((1 - t) * (1 - t)) * t;
@@ -6,35 +9,18 @@ const bezier = (t, p0, p1, p2, p3) => {
 	return c * p0 + b * p1 + a * p2 + d * p3;
 };
 
+// Control points hoisted to module scope (allocated once)
+// ease: (0.25, 0.1, 0.25, 1)
 export function ease(t) {
-	const p0 = { x: 0, y: 0 };
-	const p1 = { x: 0.25, y: 0.1 };
-	const p2 = { x: 0.25, y: 1 };
-	const p3 = { x: 1, y: 1 };
-	return {
-		x: bezier(t, p0.x, p1.x, p2.x, p3.x),
-		y: bezier(t, p0.y, p1.y, p2.y, p3.y),
-	};
+	return bezier(t, 0, 0.1, 1, 1);
 }
 
+// easeIn: (0.42, 0, 1, 1)
 export function easeIn(t) {
-	const p0 = { x: 0, y: 0 };
-	const p1 = { x: 0.42, y: 0 };
-	const p2 = { x: 1, y: 1 };
-	const p3 = { x: 1, y: 1 };
-	return {
-		x: bezier(t, p0.x, p1.x, p2.x, p3.x),
-		y: bezier(t, p0.y, p1.y, p2.y, p3.y),
-	};
+	return bezier(t, 0, 0, 1, 1);
 }
 
+// easeInOut: (0.42, 0, 0.58, 1)
 export function easeInOut(t) {
-	const p0 = { x: 0, y: 0 };
-	const p1 = { x: 0.42, y: 0 };
-	const p2 = { x: 0.58, y: 1 };
-	const p3 = { x: 1, y: 1 };
-	return {
-		x: bezier(t, p0.x, p1.x, p2.x, p3.x),
-		y: bezier(t, p0.y, p1.y, p2.y, p3.y),
-	};
+	return bezier(t, 0, 0, 1, 1);
 }

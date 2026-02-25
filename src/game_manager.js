@@ -9,6 +9,16 @@ export class GameManager {
 		this.actuator = new Actuator();
 
 		this.startTiles = 2;
+		this._serializeTimerId = 0;
+
+		// Flush any pending deferred serialization before exit so
+		// the StorageManager has up-to-date state when it writes to disk.
+		addEventListener('unload', () => {
+			clearTimeout(this._serializeTimerId);
+			if (!this.over) {
+				this.storageManager.setGameState(this.serialize());
+			}
+		});
 
 		this.setup();
 	}
@@ -74,11 +84,17 @@ export class GameManager {
 			this.storageManager.setBestScore(this.score);
 		}
 
-		// Clear the state when the game is over (game over only, not win)
+		// Defer serialization to avoid doing expensive deep-copy on every
+		// rapid input. Cancel any pending serialization timer first.
+		clearTimeout(this._serializeTimerId);
 		if (this.over) {
 			this.storageManager.clearGameState();
 		} else {
-			this.storageManager.setGameState(this.serialize());
+			// Serialize after a short delay -- if another move arrives before
+			// the timer fires, the previous serialization is skipped entirely.
+			this._serializeTimerId = setTimeout(() => {
+				this.storageManager.setGameState(this.serialize());
+			}, 200);
 		}
 
 		this.actuator.actuate(this.grid, {

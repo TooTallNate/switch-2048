@@ -40,8 +40,6 @@ const tileMoveDuration = 100;
 const scoreAnimationDuration = 600;
 const messageFadeAnimationDuration = 800;
 
-const scoreDiffMeasureCache = new Map();
-
 export class CanvasActuator {
 	constructor() {
 		this.lastUpdateAt = 0;
@@ -121,26 +119,166 @@ export class CanvasActuator {
 		this.score = 0;
 		this.scoreAnimations = new Map();
 
-		this.updateGridContainer = this.updateGridContainer.bind(this);
-		this.drawScore = this.drawScore.bind(this);
+		// Track whether we already vibrated for the current move
+		this.hasVibratedForMove = false;
+
+		// Track whether an animation is currently running
+		this.animationFrameId = 0;
+
+		// --- Offscreen canvas: static grid background (grid container + 16 empty cells) ---
+		this.gridBgCanvas = new OffscreenCanvas(this.gridSize, this.gridSize);
+		this._renderGridBackground();
+
+		// --- Offscreen canvas cache for individual tiles (keyed by tile value) ---
+		this.tileCacheMap = new Map();
+		this._warmTileCache();
+
+		// Bind the unified render loop
+		this._animationLoop = this._animationLoop.bind(this);
+	}
+
+	/**
+	 * Pre-render the static grid background (container + empty cells) to an offscreen canvas.
+	 * Called once during construction.
+	 */
+	_renderGridBackground() {
+		const offCtx = this.gridBgCanvas.getContext('2d');
+		offCtx.textAlign = 'center';
+		offCtx.textBaseline = 'middle';
+
+		// Grid container (coordinates relative to offscreen canvas: 0,0)
+		offCtx.beginPath();
+		offCtx.roundRect(0, 0, this.gridSize, this.gridSize, 8);
+		offCtx.fillStyle = gridContainerColor;
+		offCtx.fill();
+
+		// Empty cells
+		for (let x = 0; x < 4; x++) {
+			for (let y = 0; y < 4; y++) {
+				const cx =
+					this.gridSpacing + x * (this.tileSize + this.gridSpacing);
+				const cy =
+					this.gridSpacing + y * (this.tileSize + this.gridSpacing);
+				offCtx.beginPath();
+				offCtx.roundRect(cx, cy, this.tileSize, this.tileSize, 6);
+				offCtx.fillStyle = emptyTileColor;
+				offCtx.fill();
+			}
+		}
+	}
+
+	/**
+	 * Pre-render a tile with the given value to an offscreen canvas and cache it.
+	 * Returns the cached OffscreenCanvas.
+	 */
+	_getCachedTile(value) {
+		let cached = this.tileCacheMap.get(value);
+		if (cached) return cached;
+
+		const size = this.tileSize;
+		const canvas = new OffscreenCanvas(size, size);
+		const offCtx = canvas.getContext('2d');
+		offCtx.textAlign = 'center';
+		offCtx.textBaseline = 'middle';
+
+		// Tile background
+		const fillStyle = tileColors[value] || tileColorMax;
+		offCtx.beginPath();
+		offCtx.roundRect(0, 0, size, size, 6);
+		offCtx.fillStyle = fillStyle;
+		offCtx.fill();
+
+		// Tile number text
+		const val = String(value);
+		const fontSize = tileLengthFontSizes[val.length];
+		offCtx.font = `bold ${fontSize}px "Clear Sans"`;
+		offCtx.fillStyle = value > 4 ? fontColorLight : fontColorDark;
+		offCtx.fillText(val, size / 2, size / 2);
+
+		this.tileCacheMap.set(value, canvas);
+		return canvas;
+	}
+
+	/**
+	 * Pre-warm the tile cache for common values so the first render is fast.
+	 */
+	_warmTileCache() {
+		for (const value of [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]) {
+			this._getCachedTile(value);
+		}
 	}
 
 	actuate(grid, metadata) {
-		this.lastUpdateAt = Date.now();
-		cancelAnimationFrame(this.updateGridContainerTimeoutId);
-		this.updateGridContainer(grid, metadata);
+		// If an animation was in progress, instantly finish it by drawing
+		// the previous state at t=1 (final positions). This prevents
+		// the visual "teleporting" stutter when rapid inputs arrive.
+		if (this.animationFrameId) {
+			cancelAnimationFrame(this.animationFrameId);
+			this.animationFrameId = 0;
+			// Draw previous frame's grid at final state if we have one
+			if (this._prevGrid) {
+				this._drawGridAtTime(this._prevGrid, this._prevMetadata, tileMoveDuration);
+			}
+		}
+
+		this.lastUpdateAt = performance.now();
+		this.hasVibratedForMove = false;
+
+		// Store current grid/metadata for the animation loop and for
+		// instant-finish on next rapid input
+		this._prevGrid = grid;
+		this._prevMetadata = metadata;
+
 		this.updateScore(metadata.score);
 		this.drawBestScore(metadata.bestScore);
+
+		// Kick off the unified animation loop
+		this._animationLoop();
 	}
 
-	updateGridContainer(grid, metadata) {
-		const delta = Date.now() - this.lastUpdateAt;
+	/**
+	 * Unified animation loop. Drives both the grid tile animation
+	 * and the floating score animation in a single rAF callback.
+	 */
+	_animationLoop() {
+		const now = performance.now();
+		const delta = now - this.lastUpdateAt;
+		const grid = this._prevGrid;
+		const metadata = this._prevMetadata;
 
-		this.drawGridContainer(grid);
+		// --- Draw grid + tiles ---
+		this._drawGridAtTime(grid, metadata, delta);
 
-		let shouldVibrate = false;
+		// --- Draw score animations ---
+		this._drawScoreAnimations(now);
+
+		// Determine if we need another frame
+		let animationDuration = tileMoveDuration;
+		if (metadata.terminated && this.continueGameAt === 0) {
+			animationDuration = messageFadeAnimationDuration;
+		}
+
+		const gridAnimating = delta < animationDuration;
+		const scoreAnimating = this.scoreAnimations.size > 0;
+
+		if (gridAnimating || scoreAnimating) {
+			this.animationFrameId = requestAnimationFrame(this._animationLoop);
+		} else {
+			this.animationFrameId = 0;
+		}
+	}
+
+	/**
+	 * Draw the grid and all tiles at a specific point in the animation timeline.
+	 */
+	_drawGridAtTime(grid, metadata, delta) {
+		const { ctx } = this;
+
+		// Blit the cached grid background (container + empty cells) in one call
+		ctx.drawImage(this.gridBgCanvas, this.gridX, this.gridY);
 
 		// Draw active cells
+		let shouldVibrate = false;
 		for (let x = 0; x < grid.size; x++) {
 			for (let y = 0; y < grid.size; y++) {
 				const tile = grid.cells[x][y];
@@ -153,49 +291,25 @@ export class CanvasActuator {
 			}
 		}
 
-		if (shouldVibrate) {
+		// Vibrate once per move, not once per frame
+		if (shouldVibrate && !this.hasVibratedForMove) {
+			this.hasVibratedForMove = true;
 			navigator.vibrate(100);
 		}
 
-		let animationDuration = tileMoveDuration;
-
+		// Game over / win message overlay
 		if (metadata.terminated && this.continueGameAt === 0) {
-			animationDuration = messageFadeAnimationDuration;
 			if (metadata.over) {
-				this.message(false, delta); // You lose
+				this.message(false, delta);
 			} else if (metadata.won) {
-				this.message(true, delta); // You win!
-			}
-		}
-
-		if (delta < animationDuration) {
-			this.updateGridContainerTimeoutId = requestAnimationFrame(() => {
-				this.updateGridContainer(grid, metadata);
-			});
-		}
-	}
-
-	drawGridContainer(grid) {
-		const { ctx } = this;
-
-		// Draw grid container
-		ctx.beginPath();
-		ctx.roundRect(this.gridX, this.gridY, this.gridSize, this.gridSize, 8);
-		ctx.fillStyle = gridContainerColor;
-		ctx.fill();
-
-		// Draw empty cells
-		for (let x = 0; x < grid.size; x++) {
-			for (let y = 0; y < grid.size; y++) {
-				const tilePos = this.tilePosition(x, y);
-				this.drawTile(null, tilePos.x, tilePos.y);
+				this.message(true, delta);
 			}
 		}
 	}
 
 	// Continues the game (both restart and keep playing)
 	continueGame() {
-		this.continueGameAt = Date.now();
+		this.continueGameAt = performance.now();
 	}
 
 	tilePosition(x, y) {
@@ -217,8 +331,8 @@ export class CanvasActuator {
 			const e = easeInOut(t);
 			const dx = tilePos.x - oldPos.x;
 			const dy = tilePos.y - oldPos.y;
-			const x = oldPos.x + dx * e.y;
-			const y = oldPos.y + dy * e.y;
+			const x = oldPos.x + dx * e;
+			const y = oldPos.y + dy * e;
 			this.drawTile(tile, x, y);
 		} else if (tile.mergedFrom) {
 			const t = Math.min(delta / tileMoveDuration, 1);
@@ -241,22 +355,19 @@ export class CanvasActuator {
 	}
 
 	drawTile(tile, x, y) {
-		const { ctx } = this;
-		let fillStyle = emptyTileColor;
 		if (tile?.value) {
-			fillStyle = tileColors[tile.value] || tileColorMax;
-		}
-		ctx.beginPath();
-		ctx.roundRect(x, y, this.tileSize, this.tileSize, 6);
-		ctx.fillStyle = fillStyle;
-		ctx.fill();
-
-		if (tile?.value) {
-			const val = String(tile.value);
-			const fontSize = tileLengthFontSizes[val.length];
-			ctx.font = `bold ${fontSize}px "Clear Sans"`;
-			ctx.fillStyle = tile.value > 4 ? fontColorLight : fontColorDark;
-			ctx.fillText(val, x + this.tileSize / 2, y + this.tileSize / 2);
+			// Use cached offscreen tile canvas -- single drawImage instead of
+			// roundRect + fill + font change + fillText
+			const cached = this._getCachedTile(tile.value);
+			this.ctx.drawImage(cached, x, y);
+		} else {
+			// Empty tile (shouldn't normally be called since grid bg handles these,
+			// but kept as a safety fallback)
+			const { ctx } = this;
+			ctx.beginPath();
+			ctx.roundRect(x, y, this.tileSize, this.tileSize, 6);
+			ctx.fillStyle = emptyTileColor;
+			ctx.fill();
 		}
 	}
 
@@ -264,12 +375,17 @@ export class CanvasActuator {
 		const difference = score - this.score;
 		this.score = score;
 		if (difference > 0) {
-			this.scoreAnimations.set(Date.now(), difference);
+			this.scoreAnimations.set(performance.now(), difference);
 		}
-		this.drawScore();
+		// Draw the score box immediately (the floating animations are
+		// handled by the unified animation loop)
+		this._drawScoreBox();
 	}
 
-	drawScore() {
+	/**
+	 * Draw the static score box (background + "SCORE" label + current score number).
+	 */
+	_drawScoreBox() {
 		const { ctx } = this;
 		const scoreWidth = this.scoreBoxWidth;
 		const scoreHeight = this.scoreBoxHeight;
@@ -296,25 +412,46 @@ export class CanvasActuator {
 		const scoreStr = String(this.score);
 		const scoreTextY = 68 + scoreY;
 		ctx.fillText(scoreStr, scoreTextX, scoreTextY);
+	}
 
-		const now = Date.now();
+	/**
+	 * Draw floating "+N" score animations. Called from the unified animation loop.
+	 *
+	 * The floaters start inside the score box and drift upward, so we must
+	 * redraw the score box first to clear any ghosted text from the previous
+	 * frame before painting the new positions.
+	 */
+	_drawScoreAnimations(now) {
+		if (this.scoreAnimations.size === 0) return;
+
+		const { ctx } = this;
+		const scoreWidth = this.scoreBoxWidth;
+		const scoreHeight = this.scoreBoxHeight;
+		const scoreX =
+			ctx.canvas.width - this.sidebarWidth + this.scoreBoxWidth / 2;
+		const scoreY = 80;
+		const scoreTextX = scoreX + scoreWidth / 2;
+		const scoreTextY = 68 + scoreY;
+
+		// Clear the full region the floaters can occupy (above + over the score box)
+		// then redraw the score box so ghosted "+N" text from previous frames is erased.
+		ctx.fillStyle = bgColor;
+		ctx.fillRect(scoreX, scoreY - 80, scoreWidth, scoreHeight + 80);
+		this._drawScoreBox();
+
+		ctx.font = 'bold 36px "Clear Sans"';
 
 		for (const [startedAt, difference] of this.scoreAnimations.entries()) {
 			const diff = now - startedAt;
 			const t = Math.min(diff / scoreAnimationDuration, 1);
 			const e = easeIn(t);
-			ctx.fillStyle = `rgba(119, 110, 101, ${1 - e.y})`;
+			ctx.fillStyle = `rgba(119, 110, 101, ${1 - e})`;
 			const scoreDiff = `+${difference}`;
-			const y = scoreTextY - scoreHeight * e.y;
-			const scoreTextX = scoreX + scoreWidth / 2;
+			const y = scoreTextY - scoreHeight * e;
 			ctx.fillText(scoreDiff, scoreTextX, y);
 			if (t === 1) {
 				this.scoreAnimations.delete(startedAt);
 			}
-		}
-
-		if (this.scoreAnimations.size > 0) {
-			requestAnimationFrame(this.drawScore);
 		}
 	}
 
@@ -352,12 +489,12 @@ export class CanvasActuator {
 		const e = ease(t);
 
 		this.ctx.beginPath();
-		this.ctx.fillStyle = `rgba(255, 255, 255, ${e.y / 2})`;
+		this.ctx.fillStyle = `rgba(255, 255, 255, ${e / 2})`;
 		this.ctx.roundRect(this.gridX, this.gridY, this.gridSize, this.gridSize, 8);
 		this.ctx.fill();
 
 		this.ctx.font = 'bold 64px "Clear Sans"';
-		this.ctx.fillStyle = `rgba(119, 110, 101, ${e.y})`;
+		this.ctx.fillStyle = `rgba(119, 110, 101, ${e})`;
 		const message = won ? 'You win!' : 'Game over!';
 		const x = this.gridX + this.gridSize / 2;
 		const y = this.gridY + this.gridSize / 2;
